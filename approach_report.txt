@@ -1,0 +1,182 @@
+IFC Export Wrapper for PythonOCC 3D CAD Models — Approach Report
+================================================================
+Author: Aditya Sarna
+Date:   April 2026
+Repository: https://github.com/Aditya-Sarna/ifc-export-wrapper
+
+
+1. Problem Statement
+--------------------
+Osdag generates 3D CAD models of steel connections using PythonOCC (OpenCASCADE).
+These models exist only as in-memory BREP shapes and are not interoperable with
+BIM tools (Revit, ArchiCAD, BIMvision, etc.). The goal was to add an IFC export
+layer so that:
+
+  a) Every 3D connection model can be saved as a standards-compliant .ifc file.
+  b) The existing Osdag GUI can display the 3D model by reading it back from IFC
+     instead of directly from BRep, proving the IFC round-trip works.
+  c) Correct spatial orientation (Z-up, IS 800 convention) is maintained across
+     four target connection modules.
+
+
+2. Scope of Changes
+-------------------
+Files added or modified (10 files, ~886 new lines):
+
+  Core IFC Pipeline (src/osdag_core/export_ifc/)
+    - axis_mapper.py            NEW  — Global + per-module local axis definitions
+    - ifc_generator.py          MODIFIED — Project hierarchy, geometry contexts, export orchestration
+    - ifc_viewer.py             NEW  — IFC-to-OCC bridge for GUI display
+    - subprocess_ifc_exporter.py MODIFIED — Subprocess-safe export with CAD proxy objects
+
+  GUI Integration (src/osdag_gui/)
+    - __main__.py               MODIFIED — Activates IFC display patch at startup
+    - OS_safety_protocols/environment_config.py  MODIFIED — ifcopenshell env setup
+    - ui/components/custom_buttons.py            MODIFIED — "Export IFC" button
+    - ui/components/docks/input_dock.py          MODIFIED — IFC export trigger in input panel
+    - ui/components/docks/output_dock.py         MODIFIED — IFC status in output panel
+    - ui/windows/template_page.py                MODIFIED — IFC hooks in design workflow
+
+  Tests (workspace root)
+    - test_axis.py              — Unit tests for axis_mapper placement logic
+    - test_ifc_integration.py   — Integration test for full export pipeline
+    - debug_clicks.py           — GUI click-path debugging utility
+
+
+3. Approach
+-----------
+
+3.1 Axis Mapping (axis_mapper.py)
+    The IFC specification requires every IfcProduct to carry an IfcLocalPlacement
+    with an IfcAxis2Placement3D (Location, Axis, RefDirection). Structural
+    engineering uses a Z-up convention (IS 800), which differs from some CAD
+    defaults.
+
+    Approach:
+    - Defined a global world coordinate system: Z = vertical up, X = primary
+      horizontal, Y = secondary horizontal (right-hand rule).
+    - Created four module-specific placement factories, one per connection type:
+        1. BCEndplate (Beam-to-Column End Plate): origin at end-plate face,
+           local Z = column axis, local X = beam axis.
+        2. CCSpliceCoverPlate (Column-to-Column Welded): origin at splice
+           midpoint, local Z = column axis, local X = flange width direction.
+        3. BBCoverPlate (Beam-to-Beam Bolted): origin at splice midpoint,
+           local Z = global vertical, local X = beam span direction.
+        4. TensionMember (bolted to gusset): origin at gusset connection
+           point, local Z = member axis, local X = perpendicular horizontal.
+    - Each factory extracts direction vectors (wDir, uDir) and origin points
+      (sec_origin) from the live CAD object when available, and falls back to
+      sensible defaults (world origin, Z-up) when the CAD object is absent.
+    - A dispatch map (MODULE_PLACEMENT_MAP) routes each CAD class name to its
+      factory. Unknown classes get the default world-origin placement.
+    - Orthogonality is enforced numerically using cross-product correction
+      when the extracted Z and X axes are not perfectly perpendicular.
+
+3.2 IFC File Generation (ifc_generator.py)
+    The OsdagIfcExporter class manages the full IFC file lifecycle:
+
+    - Header setup: IfcOwnerHistory with Osdag application identity,
+      IfcPerson, IfcOrganization. Handles schema differences between
+      IFC2X3 (uses 'Id') and IFC4 (uses 'Identification').
+    - Project hierarchy: IfcProject -> IfcSite -> IfcBuilding ->
+      IfcBuildingStorey, with deterministic GUIDs (uuid5-based) so that
+      re-exports produce stable identifiers.
+    - Representation contexts: 3D Model context with Z-up world coordinate
+      system via axis_mapper.create_global_placement(). An optional Plan
+      sub-context is created for future 2D drawing extraction.
+    - Units: SI millimetres for length (matching Osdag internal units),
+      kilograms for mass, radians for angles.
+    - Connection-level local placement: _get_connection_local_placement()
+      delegates to axis_mapper to obtain the module-specific placement.
+    - Geometry and metadata are handled by existing GeometryMapper and
+      MetadataMapper classes which tessellate OCC shapes into
+      IfcFacetedBrep or IfcShellBasedSurfaceModel entities.
+
+3.3 IFC Viewer / Round-Trip Display (ifc_viewer.py)
+    To prove the IFC output is correct, the viewer reads the exported .ifc
+    file back and renders it in the existing PythonOCC-based 3D viewer:
+
+    Step 1 — Auto-export: _export_to_tmp_ifc() calls the IFC pipeline to
+      produce a temporary .ifc file from the live CAD object.
+    Step 2 — Shape extraction: _read_ifc_shapes() opens the IFC file via
+      ifcopenshell.geom with USE_PYTHON_OPENCASCADE=True, converting each
+      IfcProduct back into a TopoDS_Shape.
+    Step 3 — Colour-coded rendering: Each shape is displayed using the same
+      colour scheme as common_logic.py (aluminium for members, blue for
+      plates, brown for bolts, red for welds).
+    Step 4 — Monkey-patch integration: patch_common_logic_for_ifc_display()
+      wraps CommonDesignLogic.call_3DModel() so that the IFC path is tried
+      first and the original BREP display is used as a transparent fallback.
+
+    This approach does not modify the existing display code — it wraps it.
+    If ifcopenshell or OCC geometry conversion fails, the user sees the
+    original BREP rendering with no interruption.
+
+3.4 Subprocess Export (subprocess_ifc_exporter.py)
+    IFC export can be heavy and ifcopenshell may crash the main process if
+    the model is complex. The subprocess exporter:
+
+    - Serialises CAD items (members, plates, bolts, welds) to JSON.
+    - Spawns a child process that imports the IFC pipeline and runs
+      OsdagIfcExporter.export_connection() in isolation.
+    - Uses a DictToObj proxy that reconstructs attribute-access objects from
+      the JSON payload, including faking __class__.__name__ so that
+      axis_mapper's MODULE_PLACEMENT_MAP can route to the correct factory.
+    - The parent process only needs to read the resulting .ifc file.
+
+3.5 GUI Integration
+    Minimal, non-invasive changes to the GUI layer:
+
+    - __main__.py: calls patch_common_logic_for_ifc_display() at startup.
+    - environment_config.py: ensures ifcopenshell environment variables are
+      set for the current platform.
+    - custom_buttons.py: adds an "Export IFC" entry to the toolbar.
+    - input_dock.py / output_dock.py: wire the IFC export trigger into the
+      existing design workflow panels.
+    - template_page.py: hooks IFC export into the post-design step so that
+      clicking "Design" also produces an .ifc file.
+
+
+4. Design Decisions
+-------------------
+  - Fallback-first: Every IFC operation has a try/except that falls back to
+    the existing BREP pipeline. The user never sees a broken display.
+  - No new dependencies at import time: All heavy imports (ifcopenshell, OCC)
+    are lazy-loaded to avoid startup failures on machines without them.
+  - Deterministic GUIDs: Using uuid5 so that repeated exports produce the
+    same entity identifiers, which helps BIM diff tools.
+  - Schema flexibility: The exporter supports both IFC2X3 and IFC4 with
+    conditional attribute naming.
+  - Orthogonality enforcement: Cross-product correction in axis_mapper
+    guards against accumulated floating-point drift in CAD direction vectors.
+
+
+5. Testing
+----------
+  - test_axis.py: Validates that each of the four placement factories produces
+    orthogonal, unit-length axis vectors, and that the dispatch map routes
+    correctly for all registered CAD class names.
+  - test_ifc_integration.py: End-to-end test that creates a mock CAD object,
+    exports it to IFC, re-opens the file with ifcopenshell, and verifies the
+    project hierarchy, units, and product placements.
+  - debug_clicks.py: Manual GUI test utility that traces button click paths
+    to verify the IFC export is triggered at the correct points.
+
+
+6. File Inventory
+-----------------
+  src/osdag_core/export_ifc/axis_mapper.py            368 lines
+  src/osdag_core/export_ifc/ifc_generator.py          214+ lines (modified)
+  src/osdag_core/export_ifc/ifc_viewer.py             277 lines
+  src/osdag_core/export_ifc/subprocess_ifc_exporter.py 32+ lines (modified)
+  src/osdag_gui/__main__.py                            9+ lines (modified)
+  src/osdag_gui/OS_safety_protocols/environment_config.py  31+ lines (modified)
+  src/osdag_gui/ui/components/custom_buttons.py         2+ lines (modified)
+  src/osdag_gui/ui/components/docks/input_dock.py       5+ lines (modified)
+  src/osdag_gui/ui/components/docks/output_dock.py      4+ lines (modified)
+  src/osdag_gui/ui/windows/template_page.py             7+ lines (modified)
+  tests/test_axis.py
+  tests/test_ifc_integration.py
+  tests/debug_clicks.py
+
+  Total: ~886 new lines across 10 source files + 3 test files.
